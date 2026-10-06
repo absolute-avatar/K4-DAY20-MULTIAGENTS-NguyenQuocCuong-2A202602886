@@ -4,12 +4,19 @@ Pseudo-code: guides/pseudocode/01_agent.md
 Kiểm tra:    pytest tests/test_02_agent.py
 """
 from pathlib import Path
+import sys
 
 # TODO 1: import các thành phần cần dùng, ví dụ:
 #   from deepagents import create_deep_agent
 #   from deepagents.backends import LocalShellBackend
 #   from .model import make_model
 #   from .subagents import get_subagents
+
+from deepagents import create_deep_agent
+from deepagents.backends import LocalShellBackend
+
+from .model import make_model
+from .subagents import get_subagents
 
 # ---- CÓ SẴN, KHÔNG SỬA: system prompt dùng chung cho mọi sinh viên (để đường cơ sở so sánh được) ----
 PATHS_NOTE = (
@@ -47,7 +54,25 @@ def make_backend(sandbox: Path):
       - Tác tử chạy được lệnh shell và gọi được `python` (cần đặt PATH).
       - KHÔNG chuyển biến môi trường của bạn vào shell của tác tử (khóa API không được lộ).
     """
-    raise NotImplementedError("TODO 2: cài đặt make_backend (xem guides/pseudocode/01_agent.md)")
+    # TODO 2: cài đặt make_backend (xem guides/pseudocode/01_agent.md)
+    # Shell không tự dùng cùng Python với runner. Đặt thư mục của sys.executable
+    # lên đầu PATH để lệnh `python` trong sandbox chạy đúng môi trường đã cài lab.
+    # Các thư mục còn lại chứa lệnh Unix cơ bản (chạy lab qua WSL/Docker).
+    # Chỉ truyền ba biến cần thiết; inherit_env=False ngăn shell kế thừa API key.
+    env = {
+        "PATH": str(Path(sys.executable).parent) + ":/usr/local/bin:/usr/bin:/bin",
+        "HOME": str(sandbox),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    return LocalShellBackend(
+        # Công cụ tệp và execute cùng bắt đầu từ sandbox: cả hai đều hiểu
+        # `workspace/a.txt` là bản sao tác vụ, không phải tệp gốc trong kho.
+        root_dir=sandbox,
+        virtual_mode=True,
+        inherit_env=False,
+        env=env,
+        timeout=120,
+    )
 
 
 def build_agent(sandbox: Path, mode: str = "single", use_skills: bool = False, model=None):
@@ -64,4 +89,34 @@ def build_agent(sandbox: Path, mode: str = "single", use_skills: bool = False, m
     mode không hợp lệ -> ném ValueError.
     Trả về: đồ thị (graph) đã biên dịch, gọi bằng `.invoke({"messages": [...]})`.
     """
-    raise NotImplementedError("TODO 3: cài đặt build_agent (xem guides/pseudocode/01_agent.md)")
+    # TODO 3: cài đặt build_agent (xem guides/pseudocode/01_agent.md)
+    if mode not in {"single", "subagents"}:
+        raise ValueError(f"Unknown agent mode: {mode!r}")
+
+    kwargs = {}
+    prompt = BASE_PROMPT
+    if mode == "subagents":
+        # Subagent chỉ nhận system_prompt riêng và lời giao việc, không tự nhận
+        # BASE_PROMPT. Vì vậy mỗi subagent cần PATHS_NOTE để dùng đúng đường dẫn.
+        # Tạo dict mới để không sửa định nghĩa gốc của lần dựng agent sau.
+        kwargs["subagents"] = [
+            {**sub, "system_prompt": sub["system_prompt"] + " " + PATHS_NOTE}
+            for sub in get_subagents()
+        ]
+        prompt += SUBAGENTS_NOTE
+
+    if use_skills:
+        # /skills/ là đường dẫn ảo trong backend, không phải đường dẫn máy chủ.
+        # Deep Agents chỉ đưa metadata skill vào ngữ cảnh trước; agent tự chọn
+        # SKILL.md để đọc nên `skills_read` có thể vẫn bằng 0.
+        kwargs["skills"] = ["/skills/"]
+        prompt += SKILLS_NOTE
+
+    # Model truyền vào được ưu tiên để test dùng mô hình giả, không gọi API.
+    # Chế độ single vẫn có task/general-purpose do Deep Agents tự cung cấp.
+    return create_deep_agent(
+        model=model if model is not None else make_model(),
+        system_prompt=prompt,
+        backend=make_backend(sandbox),
+        **kwargs,
+    )

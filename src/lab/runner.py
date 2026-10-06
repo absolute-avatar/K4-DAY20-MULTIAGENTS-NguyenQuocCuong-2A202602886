@@ -6,10 +6,16 @@ Chạy thật:   python -m lab.runner --condition baseline --tasks learn
 """
 import argparse
 import json
+import shutil
+import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
+from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import AIMessage, ToolMessage
 
+from .agent import build_agent
 from .grading import grade                                                      # có sẵn
 from .tasks import ROOT, get_task, hash_dir, list_tasks, prepare_sandbox         # có sẵn
 
@@ -65,7 +71,96 @@ def run_task(task_id: str, condition: str, results_dir="results", model=None, re
     Lỗi khi chạy tác tử KHÔNG được làm chương trình dừng: ghi vào `error` và vẫn chấm điểm.
     Sandbox là thư mục tạm NGOÀI kho mã nguồn và phải được xóa sau khi chạy.
     """
-    raise NotImplementedError("TODO 1: cài đặt run_task (xem guides/pseudocode/03_runner.md)")
+    # TODO 1: cài đặt run_task (xem guides/pseudocode/03_runner.md)
+    cfg = CONDITIONS[condition]
+    task = get_task(task_id)
+    # Chỉ condition skills-auto có nguồn skill. prepare_sandbox sao chép chúng
+    # cùng workspace, nên mỗi lượt chạy bắt đầu từ dữ liệu và skill bất biến.
+    skills_dir = ROOT / cfg["skills_dir"] if cfg["skills_dir"] else None
+    out = Path(results_dir) / condition / task_id
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Ghi chú: thư mục tạm nằm ngoài kho; chỉ bản sao workspace được thay đổi.
+    # Giữ lại đường dẫn do mkdtemp tạo để finally chỉ dọn đúng sandbox này.
+    sandbox = Path(tempfile.mkdtemp(prefix="lab-task-"))
+    record = {
+        "task": task_id,
+        "condition": condition,
+        "role": task.role,
+        "error": None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        prepare_sandbox(task, sandbox, skills_dir)
+        before_hash = hash_dir(sandbox / "skills")
+        record["skills_sha256"] = before_hash
+
+        # Callback cộng token của mọi lần gọi model, kể cả trong subagent.
+        usage = UsageMetadataCallbackHandler()
+        messages = []
+        final = ""
+        started = time.perf_counter()
+        try:
+            # build_agent nhận bản sao sandbox; model truyền vào dùng cho test
+            # ngoại tuyến, còn None chọn model đã cấu hình trong .env.
+            agent = build_agent(
+                sandbox, mode=cfg["mode"], use_skills=skills_dir is not None, model=model,
+            )
+            # Đo thời gian invoke, không tính thời gian dựng graph nếu dựng thành công.
+            started = time.perf_counter()
+            result = agent.invoke(
+                {"messages": [{"role": "user", "content": task.instruction}]},
+                config={"callbacks": [usage], "recursion_limit": recursion_limit},
+            )
+            messages = result["messages"]
+            final = messages[-1].content if messages else ""
+        except Exception as exc:  # noqa: BLE001
+            # Lỗi API/cấu hình/giới hạn bước vẫn được lưu và workspace vẫn được chấm.
+            # Nếu invoke thất bại, không có messages trả về: vết và số tool call
+            # sẽ rỗng/0, dù callback có thể đã ghi nhận token trước lúc lỗi.
+            record["error"] = f"{type(exc).__name__}: {exc}"
+
+        record["seconds"] = round(time.perf_counter() - started, 1)
+        record["tokens"] = {
+            # Callback nhận cả các lời gọi model của subagent, khác với trace
+            # vốn chỉ chứa messages của luồng chính.
+            key: sum(item.get(f"{key}_tokens", 0) for item in usage.usage_metadata.values())
+            for key in ("input", "output", "total")
+        }
+
+        # Chỉ các AIMessage luồng chính xuất hiện trong result["messages"].
+        # Vì vậy số tool call không bao gồm các công cụ chạy bên trong subagent.
+        calls = [call for message in messages if isinstance(message, AIMessage) for call in message.tool_calls]
+        record["tool_calls"] = len(calls)
+        record["subagent_calls"] = sum(call["name"] == "task" for call in calls)
+        skills_read = set()
+        for call in calls:
+            if call["name"] == "read_file":
+                file_path = call["args"].get("file_path", "")
+                if "skills/" in file_path:
+                    # Lấy tên thư mục ngay sau skills/; set loại lần đọc lặp.
+                    # Đây là số skill đã được mở, không phải số skill đã nạp.
+                    name = file_path.split("skills/", 1)[1].split("/", 1)[0]
+                    if name:
+                        skills_read.add(name)
+        record["skills_read"] = len(skills_read)
+        record["skills_modified"] = hash_dir(sandbox / "skills") != before_hash
+        record["final_message"] = final
+
+        # Chấm bản sao sau khi chạy, rồi lưu vết trước khi xóa sandbox.
+        # Chỉ lấy các trường điểm để lỗi checker không ghi đè lỗi của tác tử.
+        grading = grade(task, sandbox / "workspace")
+        record.update({key: grading[key] for key in ("score", "passed", "total", "checks")})
+        if grading.get("error"):
+            grading_error = f"Grading error: {grading['error']}"
+            record["error"] = f"{record['error']}; {grading_error}" if record["error"] else grading_error
+        (out / "trace.md").write_text(render_trace(messages), encoding="utf-8")
+    finally:
+        # Sandbox là đường dẫn tuyệt đối do mkdtemp tạo, không phải workspace gốc.
+        shutil.rmtree(sandbox)
+
+    (out / "run.json").write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+    return record
 
 
 def main(argv=None):

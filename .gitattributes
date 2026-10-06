@@ -1,0 +1,2 @@
+# Keep byte-checked task tests in the canonical LF format on Windows too.
+tasks/**/workspace/tests/*.py text eol=lf
